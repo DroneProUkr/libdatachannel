@@ -2,7 +2,6 @@ Source: libdatachannel
 Priority: optional
 Maintainer: special-delivery <development@special-delivery.org>
 Build-Depends: debhelper-compat (= 13),
-               cmake,
                libssl-dev
 Standards-Version: 4.6.0
 Section: libs
