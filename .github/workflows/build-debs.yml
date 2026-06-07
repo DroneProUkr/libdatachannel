@@ -2,7 +2,7 @@ name: Build Debian packages
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -24,14 +24,11 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-      - name: Ensure submodule tags are present (dbs derives the version from them)
+      - name: Fetch submodule tags (dbs derives the version from them)
         shell: bash
         run: |
           set -euo pipefail
           git submodule foreach --recursive 'git fetch --tags --force origin || true'
-          echo "libdatachannel describe: $(git -C libdatachannel describe --tags HEAD 2>/dev/null || echo NONE)"
-          test -n "$(git -C libdatachannel tag --merged HEAD)" \
-            || { echo "::error::no usable tag reachable in libdatachannel submodule — dbs would emit a bogus 0.0.1+N version"; exit 1; }
       - name: Install GitPython (host changelog generator dependency)
         run: |
           sudo apt-get update
@@ -77,3 +74,84 @@ jobs:
           name: debs-${{ matrix.dist }}-${{ matrix.arch }}
           path: out/${{ matrix.dist }}/*/*.deb
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout project (full history + submodules)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Fetch submodule tags (dbs derives the version from them)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule foreach --recursive 'git fetch --tags --force origin || true'
+      - name: Install GitPython (host changelog generator dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-git
+      - name: Checkout dbs tool
+        uses: actions/checkout@v6
+        with:
+          repository: zarcsis/DBS
+          path: .dbs
+      - name: Generate changelog, extract version and release notes
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ./.dbs/dbs-changelog . > changelog
+          version="$(sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p' changelog)"
+          [ -n "$version" ] || { echo "::error::could not parse version from generated changelog"; exit 1; }
+          awk 'NR==1{print;next} /^[A-Za-z0-9]/{exit} {print}' changelog > RELEASE_NOTES.md
+          # Snapshot ('+N') and Debian pre-release ('~') versions -> pre-release.
+          case "$version" in *+*|*~*) prerelease=true ;; *) prerelease=false ;; esac
+          # git refs forbid '~' (dbs maps an upstream '-', e.g. v0.19.0-alpha.6, to
+          # a '~' Debian version); map it back to '-' for the TAG only.
+          tag="v$(printf '%s' "$version" | tr '~' '-')"
+          git check-ref-format "refs/tags/$tag" || { echo "::error::computed tag '$tag' is not a valid git ref"; exit 1; }
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $tag (version=$version, prerelease=$prerelease)"
+          cat RELEASE_NOTES.md
+      - name: Download all built .deb artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: debs-*
+          path: dist
+      - name: Collect release assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -name '*.deb' -print0 | sort -z | while IFS= read -r -d '' f; do
+            art="${f#dist/}"; art="${art%%/*}"   # debs-<suite>-<arch>
+            cell="${art#debs-}"; suite="${cell%-*}"
+            dest="release/${suite}-$(basename "$f")"
+            [ -e "$dest" ] || cp "$f" "$dest"
+          done
+          ls -l release
+          ls release/*.deb >/dev/null 2>&1 || { echo "::error::no .deb assets collected"; exit 1; }
+          # Guard against build/release version skew: the assets must carry $VERSION.
+          ls release/*.deb | grep -qF "_${VERSION}_" || { echo "::error::collected .deb do not match release version ${VERSION}"; exit 1; }
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          files: release/*.deb
+          fail_on_unmatched_files: true
