@@ -36,7 +36,7 @@ jobs:
       - name: Checkout dbs tool
         uses: actions/checkout@v6
         with:
-          repository: zarcsis/DBS
+          repository: DroneProUkr/DBS
           path: .dbs
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -99,7 +99,7 @@ jobs:
       - name: Checkout dbs tool
         uses: actions/checkout@v6
         with:
-          repository: zarcsis/DBS
+          repository: DroneProUkr/DBS
           path: .dbs
       - name: Generate changelog, extract version and release notes
         id: meta
