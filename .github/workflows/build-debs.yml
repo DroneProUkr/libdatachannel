@@ -1,0 +1,79 @@
+name: Build Debian packages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dist: [bookworm, trixie]
+        arch: ["32", "64"]
+
+    steps:
+      - name: Checkout project (full history + submodules)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Ensure submodule tags are present (dbs derives the version from them)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule foreach --recursive 'git fetch --tags --force origin || true'
+          echo "libdatachannel describe: $(git -C libdatachannel describe --tags HEAD 2>/dev/null || echo NONE)"
+          test -n "$(git -C libdatachannel tag --merged HEAD)" \
+            || { echo "::error::no usable tag reachable in libdatachannel submodule — dbs would emit a bogus 0.0.1+N version"; exit 1; }
+      - name: Install GitPython (host changelog generator dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-git
+      - name: Checkout dbs tool
+        uses: actions/checkout@v6
+        with:
+          repository: zarcsis/DBS
+          path: .dbs
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute lowercase GHCR image ref
+        id: img
+        shell: bash
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Build .deb with dbs
+        shell: bash
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          CACHE_REF: ${{ steps.img.outputs.ref }}:buildcache-${{ matrix.dist }}-${{ matrix.arch }}
+          DBS_HOME: ${{ runner.temp }}/dbs
+        run: |
+          set -euo pipefail
+          mkdir -p "$DBS_HOME/droneprorepo"
+          git -C "$DBS_HOME/droneprorepo" init -q
+          bash ./.dbs/dbs . --dist "${{ matrix.dist }}" --arch "${{ matrix.arch }}" -- \
+            --provenance=false --sbom=false \
+            --load \
+            --cache-from "type=registry,ref=${CACHE_REF}" \
+            --cache-to   "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true,oci-mediatypes=true"
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-${{ matrix.dist }}-${{ matrix.arch }}
+          path: out/${{ matrix.dist }}/*/*.deb
+          if-no-files-found: error
